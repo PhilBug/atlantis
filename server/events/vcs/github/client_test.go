@@ -308,40 +308,52 @@ func TestClient_HideOldComments(t *testing.T) {
 	}
 
 	cases := []struct {
+		name                string
 		dir                 string
 		processedComments   int
 		processedCommentIds []string
 		minimizedCommentID  string
+		deletedCommentID    string
 		queryError          bool
 	}{
 		{
 			// With no dir specified, comments 6, 8, 9 and 10 should be minimized.
+			name:                "no dir",
 			processedComments:   4,
 			processedCommentIds: []string{"6", "8", "9", "10"},
 		},
 		{
 			// With a dir of "stack1", comment 8 should be minimized.
+			name:                "stack1",
 			dir:                 "stack1",
 			processedComments:   1,
 			processedCommentIds: []string{"8"},
 		},
 		{
 			// With a dir of "stack2", comment 9 should be minimized.
+			name:                "stack2",
 			dir:                 "stack2",
 			processedComments:   1,
 			processedCommentIds: []string{"9"},
 		},
 		{
+			name:                "already minimized comment is skipped",
 			processedComments:   3,
 			processedCommentIds: []string{"8", "9", "10"},
 			minimizedCommentID:  "6",
 		},
-		{dir: "no-matching-dir"},
-		{queryError: true},
+		{
+			name:                "comment deleted after listing is skipped",
+			processedComments:   3,
+			processedCommentIds: []string{"6", "8", "10"},
+			deletedCommentID:    "9",
+		},
+		{name: "no matching comments", dir: "no-matching-dir"},
+		{name: "lookup error", queryError: true},
 	}
 
 	for _, c := range cases {
-		t.Run(c.dir, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			gotMinimizeCalls := make([]graphQLCall, 0, 1)
 			queryCalls := 0
 			testServer := httptest.NewTLSServer(
@@ -378,11 +390,19 @@ func TestClient_HideOldComments(t *testing.T) {
 								w.Write([]byte(`{"errors":[{"message":"lookup failed"}]}`)) // nolint: errcheck
 								return
 							}
-							nodes := make([]map[string]any, 0, len(call.Variables.IDs))
+							nodes := make([]any, 0, len(call.Variables.IDs))
 							for _, id := range call.Variables.IDs {
+								if id == c.deletedCommentID {
+									nodes = append(nodes, nil)
+									continue
+								}
 								nodes = append(nodes, map[string]any{"id": id, "isMinimized": id == c.minimizedCommentID})
 							}
-							Ok(t, json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"nodes": nodes}}))
+							resp := map[string]any{"data": map[string]any{"nodes": nodes}}
+							if c.deletedCommentID != "" {
+								resp["errors"] = []map[string]any{{"type": "NOT_FOUND", "message": "Not Found"}}
+							}
+							Ok(t, json.NewEncoder(w).Encode(resp))
 							return
 						}
 						gotMinimizeCalls = append(gotMinimizeCalls, call)

@@ -273,6 +273,7 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
 		nextPage = resp.NextPage
 	}
 
+	var commentIDs []githubv4.ID
 	for _, comment := range allComments {
 		// Using a case insensitive compare here because usernames aren't case
 		// sensitive and users may enter their atlantis users with different
@@ -298,24 +299,57 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
 			continue
 		}
 
-		var m struct {
-			MinimizeComment struct {
-				MinimizedComment struct {
-					IsMinimized       githubv4.Boolean
-					MinimizedReason   githubv4.String
-					ViewerCanMinimize githubv4.Boolean
-				}
-			} `graphql:"minimizeComment(input:$input)"`
+		commentIDs = append(commentIDs, comment.GetNodeID())
+	}
+
+	// GitHub rejects larger nodes queries with "You may not provide more than 100 node ids".
+	alreadyHidden := 0
+	for ids := range slices.Chunk(commentIDs, 100) {
+		var query struct {
+			Nodes []struct {
+				IssueComment struct {
+					ID          githubv4.ID
+					IsMinimized githubv4.Boolean
+				} `graphql:"... on IssueComment"`
+			} `graphql:"nodes(ids:$ids)"`
 		}
-		input := githubv4.MinimizeCommentInput{
-			Classifier: githubv4.ReportedContentClassifiersOutdated,
-			SubjectID:  comment.GetNodeID(),
+		if err := g.v4Client.Query(g.ctx, &query, map[string]any{"ids": ids}); err != nil {
+			// A comment deleted after listing comes back as a null node plus a
+			// NOT_FOUND error. Keep hiding the comments that did resolve.
+			if len(query.Nodes) == 0 {
+				return fmt.Errorf("checking minimized state of comments: %w", err)
+			}
+			logger.Warn("checking minimized state of some comments: %s", err)
 		}
-		logger.Debug("Hiding comment %s", comment.GetNodeID())
-		if err := g.v4Client.Mutate(g.ctx, &m, input, nil); err != nil {
-			return fmt.Errorf("minimize comment %s: %w", comment.GetNodeID(), err)
+		for _, node := range query.Nodes {
+			comment := node.IssueComment
+			if comment.ID == nil {
+				continue
+			}
+			if comment.IsMinimized {
+				alreadyHidden++
+				continue
+			}
+			var m struct {
+				MinimizeComment struct {
+					MinimizedComment struct {
+						IsMinimized       githubv4.Boolean
+						MinimizedReason   githubv4.String
+						ViewerCanMinimize githubv4.Boolean
+					}
+				} `graphql:"minimizeComment(input:$input)"`
+			}
+			input := githubv4.MinimizeCommentInput{
+				Classifier: githubv4.ReportedContentClassifiersOutdated,
+				SubjectID:  comment.ID,
+			}
+			logger.Debug("Hiding comment %s", comment.ID)
+			if err := g.v4Client.Mutate(g.ctx, &m, input, nil); err != nil {
+				return fmt.Errorf("minimize comment %s: %w", comment.ID, err)
+			}
 		}
 	}
+	logger.Debug("%d of %d matching comments were already hidden", alreadyHidden, len(commentIDs))
 
 	return nil
 }

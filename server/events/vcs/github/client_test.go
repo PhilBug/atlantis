@@ -194,7 +194,9 @@ func TestClient_PaginatesComments(t *testing.T) {
 	}
 	minimizeResp := "{}"
 	type graphQLCall struct {
+		Query     string `json:"query"`
 		Variables struct {
+			IDs   []string                      `json:"ids"`
 			Input githubv4.MinimizeCommentInput `json:"input"`
 		} `json:"variables"`
 	}
@@ -215,6 +217,12 @@ func TestClient_PaginatesComments(t *testing.T) {
 				if err != nil {
 					t.Errorf("parse body error: %v", err)
 					http.Error(w, "server error", http.StatusInternalServerError)
+					return
+				}
+				if call.Variables.IDs != nil {
+					Equals(t, "query($ids:[ID!]!){nodes(ids:$ids){... on IssueComment{id,isMinimized}}}", call.Query)
+					Equals(t, []string{"2", "8"}, call.Variables.IDs)
+					w.Write([]byte(`{"data":{"nodes":[{"id":"2","isMinimized":false},{"id":"8","isMinimized":false}]}}`)) // nolint: errcheck
 					return
 				}
 				gotMinimizeCalls = append(gotMinimizeCalls, call)
@@ -292,7 +300,9 @@ func TestClient_HideOldComments(t *testing.T) {
 ]`, "'", "`")
 	minimizeResp := "{}"
 	type graphQLCall struct {
+		Query     string `json:"query"`
 		Variables struct {
+			IDs   []string                      `json:"ids"`
 			Input githubv4.MinimizeCommentInput `json:"input"`
 		} `json:"variables"`
 	}
@@ -301,30 +311,39 @@ func TestClient_HideOldComments(t *testing.T) {
 		dir                 string
 		processedComments   int
 		processedCommentIds []string
+		minimizedCommentID  string
+		queryError          bool
 	}{
 		{
 			// With no dir specified, comments 6, 8, 9 and 10 should be minimized.
-			"",
-			4,
-			[]string{"6", "8", "9", "10"},
+			processedComments:   4,
+			processedCommentIds: []string{"6", "8", "9", "10"},
 		},
 		{
 			// With a dir of "stack1", comment 8 should be minimized.
-			"stack1",
-			1,
-			[]string{"8"},
+			dir:                 "stack1",
+			processedComments:   1,
+			processedCommentIds: []string{"8"},
 		},
 		{
 			// With a dir of "stack2", comment 9 should be minimized.
-			"stack2",
-			1,
-			[]string{"9"},
+			dir:                 "stack2",
+			processedComments:   1,
+			processedCommentIds: []string{"9"},
 		},
+		{
+			processedComments:   3,
+			processedCommentIds: []string{"8", "9", "10"},
+			minimizedCommentID:  "6",
+		},
+		{dir: "no-matching-dir"},
+		{queryError: true},
 	}
 
 	for _, c := range cases {
 		t.Run(c.dir, func(t *testing.T) {
 			gotMinimizeCalls := make([]graphQLCall, 0, 1)
+			queryCalls := 0
 			testServer := httptest.NewTLSServer(
 				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch r.Method + " " + r.RequestURI {
@@ -345,6 +364,25 @@ func TestClient_HideOldComments(t *testing.T) {
 						if err != nil {
 							t.Errorf("parse body error: %v", err)
 							http.Error(w, "server error", http.StatusInternalServerError)
+							return
+						}
+						if call.Variables.IDs != nil {
+							queryCalls++
+							Equals(t, "query($ids:[ID!]!){nodes(ids:$ids){... on IssueComment{id,isMinimized}}}", call.Query)
+							expectedIDs := []string{"6", "8", "9", "10"}
+							if c.dir != "" {
+								expectedIDs = c.processedCommentIds
+							}
+							Equals(t, expectedIDs, call.Variables.IDs)
+							if c.queryError {
+								w.Write([]byte(`{"errors":[{"message":"lookup failed"}]}`)) // nolint: errcheck
+								return
+							}
+							nodes := make([]map[string]any, 0, len(call.Variables.IDs))
+							for _, id := range call.Variables.IDs {
+								nodes = append(nodes, map[string]any{"id": id, "isMinimized": id == c.minimizedCommentID})
+							}
+							Ok(t, json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"nodes": nodes}}))
 							return
 						}
 						gotMinimizeCalls = append(gotMinimizeCalls, call)
@@ -383,7 +421,17 @@ func TestClient_HideOldComments(t *testing.T) {
 				command.Plan.TitleString(),
 				c.dir,
 			)
-			Ok(t, err)
+			if c.queryError {
+				Assert(t, err != nil, "expected lookup error")
+				Equals(t, "checking minimized state of comments: lookup failed", err.Error())
+			} else {
+				Ok(t, err)
+			}
+			expectedQueryCalls := 1
+			if c.dir == "no-matching-dir" {
+				expectedQueryCalls = 0
+			}
+			Equals(t, expectedQueryCalls, queryCalls)
 			Equals(t, c.processedComments, len(gotMinimizeCalls))
 			for i := 0; i < c.processedComments; i++ {
 				Equals(t, c.processedCommentIds[i], gotMinimizeCalls[i].Variables.Input.SubjectID)
@@ -391,6 +439,74 @@ func TestClient_HideOldComments(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClient_HideOldCommentsBatches(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
+	comments := make([]map[string]any, 0, 101)
+	expectedIDs := make([]string, 0, 101)
+	for i := 1; i <= 101; i++ {
+		id := fmt.Sprint(i)
+		expectedIDs = append(expectedIDs, id)
+		comments = append(comments, map[string]any{
+			"node_id": id,
+			"body":    "Ran Plan for dir: `stack1`",
+			"user":    map[string]string{"login": "USER"},
+		})
+	}
+	var batchSizes []int
+	var lookupIDs, minimizedIDs []string
+	testServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.RequestURI {
+		case "GET /api/v3/repos/owner/repo/issues/123/comments?direction=asc&sort=created":
+			Ok(t, json.NewEncoder(w).Encode(comments))
+		case "POST /api/graphql":
+			defer r.Body.Close() // nolint: errcheck
+			var call struct {
+				Query     string `json:"query"`
+				Variables struct {
+					IDs   []string                      `json:"ids"`
+					Input githubv4.MinimizeCommentInput `json:"input"`
+				} `json:"variables"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+				t.Errorf("parse body error: %v", err)
+				http.Error(w, "server error", http.StatusInternalServerError)
+				return
+			}
+			if call.Variables.IDs != nil {
+				Equals(t, "query($ids:[ID!]!){nodes(ids:$ids){... on IssueComment{id,isMinimized}}}", call.Query)
+				Assert(t, len(call.Variables.IDs) <= 100, "nodes query exceeds 100 IDs")
+				batchSizes = append(batchSizes, len(call.Variables.IDs))
+				lookupIDs = append(lookupIDs, call.Variables.IDs...)
+				nodes := make([]map[string]any, 0, len(call.Variables.IDs))
+				for _, id := range call.Variables.IDs {
+					nodes = append(nodes, map[string]any{"id": id, "isMinimized": id != "1" && id != "101"})
+				}
+				Ok(t, json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"nodes": nodes}}))
+				return
+			}
+			Equals(t, githubv4.ReportedContentClassifiersOutdated, call.Variables.Input.Classifier)
+			minimizedIDs = append(minimizedIDs, call.Variables.Input.SubjectID.(string))
+			w.Write([]byte("{}")) // nolint: errcheck
+		default:
+			t.Errorf("got unexpected request at %q", r.RequestURI)
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer testServer.Close()
+
+	testServerURL, err := url.Parse(testServer.URL)
+	Ok(t, err)
+	client, err := github.New(testServerURL.Host, &github.UserCredentials{"user", "pass", ""}, github.Config{}, 0, logger)
+	Ok(t, err)
+	defer disableSSLVerification()()
+
+	err = client.HidePrevCommandComments(logger, models.Repo{Owner: "owner", Name: "repo"}, 123, command.Plan.TitleString(), "stack1")
+	Ok(t, err)
+	Equals(t, []int{100, 1}, batchSizes)
+	Equals(t, expectedIDs, lookupIDs)
+	Equals(t, []string{"1", "101"}, minimizedIDs)
 }
 
 func TestClient_UpdateStatus(t *testing.T) {

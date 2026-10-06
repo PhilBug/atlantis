@@ -302,7 +302,8 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
 		commentIDs = append(commentIDs, comment.GetNodeID())
 	}
 
-	// GitHub limits nodes queries to 100 IDs per request.
+	// GitHub rejects larger nodes queries with "You may not provide more than 100 node ids".
+	alreadyHidden := 0
 	for ids := range slices.Chunk(commentIDs, 100) {
 		var query struct {
 			Nodes []struct {
@@ -313,11 +314,20 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
 			} `graphql:"nodes(ids:$ids)"`
 		}
 		if err := g.v4Client.Query(g.ctx, &query, map[string]any{"ids": ids}); err != nil {
-			return fmt.Errorf("checking minimized state of comments: %w", err)
+			// A comment deleted after listing comes back as a null node plus a
+			// NOT_FOUND error. Keep hiding the comments that did resolve.
+			if len(query.Nodes) == 0 {
+				return fmt.Errorf("checking minimized state of comments: %w", err)
+			}
+			logger.Warn("checking minimized state of some comments: %s", err)
 		}
 		for _, node := range query.Nodes {
 			comment := node.IssueComment
-			if comment.ID == nil || comment.IsMinimized {
+			if comment.ID == nil {
+				continue
+			}
+			if comment.IsMinimized {
+				alreadyHidden++
 				continue
 			}
 			var m struct {
@@ -339,6 +349,7 @@ func (g *Client) HidePrevCommandComments(logger logging.SimpleLogging, repo mode
 			}
 		}
 	}
+	logger.Debug("%d of %d matching comments were already hidden", alreadyHidden, len(commentIDs))
 
 	return nil
 }
